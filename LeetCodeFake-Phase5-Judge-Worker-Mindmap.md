@@ -1,0 +1,396 @@
+# LeetCodeFake — Phase 5 Judge Worker Mind Map
+
+> XMind use: import this Markdown file, or copy the indented outline below into a root topic. Each indentation level is a child topic.
+>
+> Scope: Phase 5 Judge Worker, `ProcessBuilder`, Docker sandbox, streams, pipes, timeouts, concurrency, lifecycle, verdicts, and testcase aggregation.
+
+- LeetCodeFake — Phase 5 Judge Worker
+  - North-star mental model
+    - A judge is not "run code and read an exit code"
+      - It is a lifecycle controller and evidence classifier for untrusted code.
+      - It creates an isolated execution environment, observes events, cleans up, and publishes one final verdict.
+    - The three layers must remain separate
+      - Raw execution facts
+        - `done`: did the external process terminate before the particular wait deadline?
+        - `exitCode`: how did that process report termination?
+        - stdout, stderr, duration, resource/runtime state
+      - Events / causes / context
+        - inner timeout fired
+        - outer safety timeout expired
+        - output limit crossed
+        - OOM/container state observed
+        - judge requested a kill
+        - reader failed
+      - Verdict
+        - `COMPILATION_ERROR`, `TIME_LIMIT_EXCEEDED`, `MEMORY_LIMIT_EXCEEDED`, `OUTPUT_LIMIT_EXCEEDED`, `RUNTIME_ERROR`, `WRONG_ANSWER`, `ACCEPTED`
+      - Rule: exit code is a symptom/result; event/context explains cause; the Judge maps evidence to verdict.
+    - Two different scales
+      - One testcase: execution result + correctness verdict.
+      - One submission: aggregate all testcase results; accepted only if every testcase passes.
+
+  - Phase 5 job in the project
+    - Queue-to-result pipeline
+      - Redis queue receives `{submissionId}`.
+      - Worker loads submission and moves status `PENDING -> RUNNING`.
+      - Create an isolated temporary work directory, for example `/tmp/judge/<submissionId>/`.
+      - Write the submitted source as `Main.java`.
+      - Compile in the sandbox.
+      - If compilation fails: publish `COMPILATION_ERROR`; do not run testcases.
+      - Load all testcases for the problem.
+      - For each testcase: write input, execute, collect evidence, decide that testcase result.
+      - Fail fast on the first terminal failure under the chosen policy.
+      - If every testcase passes: publish `ACCEPTED` with total runtime.
+      - Persist the submission result, notify the client (WebSocket in Phase 6), then clean up the work directory/container resources.
+    - Existing plan baseline
+      - Sandbox image: `judge-java`, JDK 21 Alpine, non-root user `judge`, `/app` workdir.
+      - Docker constraints in the plan: `--memory=128m`, `--cpus=1`, `--network=none`, volume mount workdir to `/app`, `--rm`.
+      - Per-test inner command: `timeout 2s java -Xmx100m Main < input.txt`.
+      - Existing sample calls `readAllBytes()` before `waitFor(...)`; this is a teaching baseline, not the safe production execution pattern.
+
+  - Process, Thread, and Container
+    - Process
+      - An OS-managed running program with its own resources: address space, file descriptors, PID, environment, and one or more threads.
+      - Examples in this system
+        - Spring Boot JVM process on the host.
+        - Docker CLI process spawned by `ProcessBuilder`.
+        - `bash` process inside the container.
+        - `java Main` JVM process inside the container.
+    - Thread
+      - A path of execution inside one process; it shares that process's memory/resources with sibling threads.
+      - Examples
+        - Spring scheduler/Judge thread.
+        - Output-reader task/thread.
+        - `main`, GC, and JVM-internal threads inside the user `java Main` process.
+      - Creating a Java `Thread` does not create a new OS/JVM process.
+    - Container
+      - An isolation boundary/environment for one or more processes; it is not a thread and does not live inside a thread.
+      - It narrows what untrusted processes can access: filesystem view, user privileges, network, CPU, memory, and process environment.
+    - Relationship to remember
+      - Process contains threads.
+      - Container isolates processes.
+      - Never model it as `Process -> Thread -> Container`.
+      - Useful picture: Host -> Spring Boot process (Judge thread) -> Docker CLI process -> container -> bash process -> `java Main` process (many JVM threads).
+
+  - ProcessBuilder -> Process handle
+    - `ProcessBuilder`
+      - Describes an external command: executable plus an ordered list of arguments.
+      - Configure it before calling `start()`: working directory, environment, redirects, error-stream merge.
+    - `Process`
+      - Returned by `pb.start()`.
+      - It is a Java handle to the direct child OS process created by the builder.
+      - It provides lifecycle operations: `waitFor`, `exitValue`, `destroy`, `destroyForcibly`, and streams.
+    - Direct-target rule
+      - `new ProcessBuilder("java", "Main")` -> Process handle directly represents the host `java Main` process.
+      - `new ProcessBuilder("docker", "run", ...)` -> Process handle directly represents the host Docker CLI process.
+      - `process.destroyForcibly()` kills that direct child, not automatically and directly the inner container, `bash`, or `java Main`.
+      - Therefore a production judge must track/clean up the container separately if killing the Docker CLI does not guarantee desired cleanup.
+    - Lifecycle rule
+      - Builder configures and starts.
+      - Process waits, exposes streams/results, and is killed.
+      - Do not say "ProcessBuilder kills the process".
+
+  - Docker command parsing
+    - Example argument list
+      - `new ProcessBuilder("docker", "run", "--rm", "judge-java", "bash", "-c", "cd /app && javac Main.java")`
+    - Parse in stages
+      - Java/ProcessBuilder chooses executable `docker` and passes each remaining Java string as one argument.
+      - Docker parses `run`, Docker options, image name `judge-java`, and the container command.
+      - Docker starts `bash -c "cd /app && javac Main.java"` inside the container.
+      - Bash interprets the command string, including shell syntax such as `&&`, redirection, `< input.txt`, and `;`.
+      - Bash launches `javac` or `java`; it does not execute Java bytecode itself.
+    - Important distinctions
+      - `judge-java` is a Docker image, not the host executable.
+      - `-c` belongs to Bash, not Docker.
+      - `"cd /app && javac Main.java"` is one argument passed to Bash after `-c`.
+      - `cmd /c` syntax belongs to Windows `cmd.exe`; `exit /b 7` must not be used in Linux Bash. Bash uses `exit 7`.
+
+  - Standard streams: always use the parent/child viewpoint
+    - Child program perspective
+      - stdin enters the child.
+      - stdout leaves the child as normal output.
+      - stderr leaves the child as diagnostic/error output.
+    - Judge Worker / parent perspective
+      - `process.getOutputStream()` writes into child stdin.
+      - `process.getInputStream()` reads child stdout.
+      - `process.getErrorStream()` reads child stderr.
+      - Memory phrase: stdout of the child becomes input of the parent.
+    - `redirectErrorStream(true)`
+      - Merges child stderr into stdout before the parent reads it.
+      - Then one reader can drain the combined stream and avoid a separate stderr pipe deadlock.
+      - Trade-off: diagnostics and normal output are no longer distinguishable; do not use merged output as the answer unless the policy supports it.
+    - If stderr is not merged
+      - Drain stdout and stderr concurrently; draining only one can still deadlock the child on the other pipe.
+
+  - Pipe blocking: why sequential code is unsafe
+    - A pipe has finite kernel buffering.
+    - If the child writes faster than the parent consumes
+      - pipe buffer fills
+      - the child's next `write()` blocks
+      - the child may never reach its natural `exit()`
+      - parent can falsely observe a timeout
+    - Unsafe sequence A
+      - `start -> readAllBytes -> waitFor(timeout)`
+      - `readAllBytes()` reads until EOF.
+      - EOF typically arrives after the child closes the stream/exits.
+      - Infinite/long-running child -> reader can block forever -> code never reaches timeout.
+    - Unsafe sequence B
+      - `start -> waitFor(timeout) -> readAllBytes`
+      - parent does not drain while waiting.
+      - High-output child blocks on a full pipe before it exits.
+      - Parent reports a timeout even if computation itself would have finished quickly: a false/infrastructure-induced TLE.
+    - Correct requirement
+      - Start execution.
+      - Concurrently drain stdout/stderr from the beginning.
+      - Simultaneously monitor lifecycle/timeouts.
+      - After termination, wait for drain tasks to finish before consuming their final result.
+    - Key distinction
+      - `waitFor(timeout)` protects the Judge from an execution that remains alive too long.
+      - Continuous draining protects the child from blocking on full pipes.
+      - They solve different problems; neither replaces the other.
+
+  - Concurrent output draining and output limit
+    - Reader task responsibilities
+      - Read stdout (and stderr, either merged or separately) continuously in bounded chunks.
+      - Count bytes, not only Java characters.
+      - Store only the allowed prefix/diagnostics in a bounded buffer.
+      - Publish events such as `outputExceeded`, reader failure, and collected output.
+      - On a terminal output-limit event, request termination according to policy.
+      - Reader reports evidence; it does not choose the final verdict.
+    - Main/Judge task responsibilities
+      - Start and monitor the external execution.
+      - Enforce outer deadline and coordinate termination/cleanup.
+      - Await reader completion and collect all evidence.
+      - Interpret exit context and compare output with expected output.
+      - Own the one final testcase verdict.
+    - Why an output limit is independent of Docker memory limit
+      - `--memory=128m` caps memory inside the container/user process.
+      - A user can print a huge stream over time while holding little memory.
+      - The host Judge can still accumulate gigabytes in `ByteArrayOutputStream` and OOM.
+      - Therefore `MAX_OUTPUT_BYTES` protects Judge memory; container memory limit protects container memory.
+    - What to do after limit is reached
+      - Never simply stop reading and leave the process alive: the pipe may fill and block the child.
+      - Policy option A: stop storing but continue draining/discarding until natural finish or another limit.
+      - Policy option B: mark the event, request kill immediately, then keep/drain long enough for orderly cleanup.
+      - Online-judge default: B is usually appropriate because output beyond the limit is already a terminal failure; specify it explicitly.
+      - Decide whether the limit is combined stdout+stderr or per stream; document and test that policy.
+
+  - Timeout, kill, and exit codes
+    - `boolean done = process.waitFor(limit, unit)`
+      - Asks: did this direct external process terminate within this maximum wait?
+      - `true` = terminated before deadline, not "successful".
+      - `false` = still alive at deadline; do not call `exitValue()` until it has terminated.
+      - It returns early if the process exits/killed early; the limit is not a mandatory sleep.
+    - `process.exitValue()`
+      - Asks: what code did the already-terminated direct process return?
+      - `0` conventionally means its command reported normal success.
+      - Non-zero may mean compilation/runtime failure or a special termination condition, but is not enough by itself to identify cause.
+    - `destroy()` versus `destroyForcibly()`
+      - `destroy()` requests graceful termination where supported.
+      - `destroyForcibly()` requests forceful termination of the direct child process.
+      - After any kill request, wait/confirm termination and clean associated container/process resources.
+    - Common planned codes and their limits
+      - `0`: command success; still not proof that the answer is correct.
+      - `1`: generic command failure; may be compile/runtime failure depending on phase/context.
+      - `124`: GNU `timeout` command reported its inner timeout.
+      - `137`: often associated with a SIGKILL/OOM-style termination in Linux-derived paths, but it is ambiguous.
+      - Never treat a bare `137` as conclusive proof of OOM: Judge output-limit kill, timeout kill, an external kill, or infrastructure failure can produce similar results.
+    - Event-over-code examples
+      - `exitCode=137 + outputExceeded=true` -> `OUTPUT_LIMIT_EXCEEDED`, not generic runtime error.
+      - `exitCode=137 + oomKilled=true/container OOM state` -> `MEMORY_LIMIT_EXCEEDED`.
+      - `exitCode=137 + timedOut=true` -> timeout/kill context according to policy.
+      - `done=true + exitCode=0 + output="41" + expected="42"` -> `WRONG_ANSWER`.
+
+  - Inner and outer timeout: defense in depth
+    - Inner timeout
+      - Runs inside the sandbox, e.g. `timeout 2s java Main < input.txt`.
+      - Represents the problem's user-code time limit.
+      - On expiry, `timeout` normally produces exit code `124`.
+    - Outer timeout
+      - The host worker uses `process.waitFor(10, SECONDS)` (or a bounded deadline) around the whole Docker invocation.
+      - Protects against failures in Docker CLI/runtime, shell setup, bad inner timeout behavior, pipe/I/O problems, and cleanup stalls.
+      - It answers "did the whole external execution terminate in time?", not directly "did user code meet the problem time limit?"
+    - Defense-in-depth principle
+      - One guard may fail, be bypassed, or cover only one boundary.
+      - Use independent layers: sandbox time limit, host watchdog, Docker CPU/memory/network constraints, output cap, non-root user, workdir isolation, explicit cleanup.
+    - Classification policy must be explicit
+      - Inner timeout evidence -> normal `TIME_LIMIT_EXCEEDED` for user code.
+      - Outer timeout with no inner evidence -> a host/worker timeout/infrastructure outcome, or a TLE only if the product deliberately defines it that way.
+      - Do not silently collapse all outer failures into the same user-code cause; retain diagnostic metadata.
+
+  - Resource/security boundaries
+    - Docker/runtime enforces configured constraints
+      - `--memory=128m`: container memory.
+      - `--cpus=1`: container CPU allocation.
+      - `--network=none`: no network access.
+      - non-root `judge` user: reduce privilege.
+      - mounted per-submission work directory: narrow filesystem scope.
+      - `--rm`: remove container when Docker completes normally; still have a fallback cleanup strategy.
+    - Judge Worker must protect itself separately
+      - outer timeout and kill confirmation.
+      - output-size cap and bounded buffers.
+      - bounded concurrency/job queue to avoid host exhaustion.
+      - temp-directory/container cleanup in `finally`-style paths.
+      - diagnostics/logging that retain raw facts without exposing secrets or unsafe user output indiscriminately.
+
+  - Concurrency: three questions for every shared mutable state
+    - Ordering / timing
+      - Question: which action must happen before another?
+      - Example: Main reads `outputExceeded=false`; reader sets `true` afterwards. The read is valid—this is a timing/order issue, not a stale-memory issue.
+      - Fix: coordinate completion/phase, e.g. await reader task/Future or latch before final evaluation.
+    - Visibility
+      - Question: if reader wrote `true` first, is the write guaranteed visible to Main?
+      - A plain unsynchronized boolean has no suitable cross-thread publication guarantee.
+      - Use an explicit mechanism: `AtomicBoolean`, `volatile`, synchronized block/lock, Future completion, `CountDownLatch`, or another concurrent primitive with defined happens-before behavior.
+      - `AtomicBoolean` fits a monotonic signal such as `false -> true`.
+    - Atomicity
+      - Question: can a multi-step operation be interleaved and lose an update?
+      - `counter = counter + 1` is read -> calculate -> write; two threads can produce a lost update.
+      - Use a lock/synchronized block, an `Atomic*` operation such as `incrementAndGet`, or redesign state ownership.
+      - Atomicity does not automatically mean "always use a lock".
+    - Preferred ownership
+      - Reader owns byte reading/buffer mutation and emits immutable result/events when done.
+      - Main owns verdict selection and persistence.
+      - Reduce shared mutable state rather than adding synchronization everywhere.
+    - Minimum coordination checklist
+      - Process reference: both tasks may need lifecycle/termination access; define cancellation ownership.
+      - Output buffer: Main must not compare it until reader completion is awaited.
+      - Output-limit flag: make visibility explicit.
+      - Reader exception: propagate through a Future/result, do not lose it in a background thread.
+      - Final status: exactly one owner (Main/Judge); readers never race to set it.
+
+  - Judge events, race conditions, and final-verdict policy
+    - Events are not verdicts
+      - Reader: "combined output crossed limit".
+      - Main: "outer deadline expired".
+      - Runtime: "container reported OOM".
+      - Process: "direct child exited with code N".
+      - Judge: combines evidence, applies policy, produces exactly one verdict.
+    - Near-simultaneous failure example
+      - Reader detects output limit near 2 seconds and asks to kill.
+      - Main observes outer timeout near the same instant and asks to kill.
+      - Thread identity is not a fair priority rule; Main being final decider does not make timeout automatically more important.
+    - Deterministic policy options
+      - First terminal event wins: attach monotonic timestamp/sequence; atomically claim terminal cause.
+      - Fixed precedence: define and document an ordered table, e.g. output-limit evidence before generic kill/exit-code fallback.
+      - Evidence-specific: prefer a directly observed cause over an ambiguous exit code; use outer timeout only when no earlier/more-specific cause is known.
+    - Required invariants
+      - Exactly one terminal verdict per testcase.
+      - Events are recorded before/with any kill request.
+      - Final evaluation happens after process termination and reader-result coordination.
+      - Raw exit code is retained for debugging even when it is not the verdict cause.
+      - Every path performs cleanup and reports failure consistently.
+
+  - Per-testcase verdict decision flow
+    - Start from complete evidence, not from one field
+      - Ensure process termination/outer decision is known.
+      - Await stream-drain tasks and collect their result/error.
+      - Collect execution events, direct-process exit code, container state where available, output, and duration.
+    - Suggested evaluation order (policy; make it explicit in code/tests)
+      - Did outer safety deadline expire without a more-specific recorded cause?
+        - terminate/cleanup; classify as outer/infrastructure timeout or chosen product fallback.
+      - Did output-limit event occur?
+        - `OUTPUT_LIMIT_EXCEEDED`.
+      - Did trusted OOM/resource evidence occur?
+        - `MEMORY_LIMIT_EXCEEDED` or matching resource verdict.
+      - Did inner `timeout` fire / return the known inner-timeout code?
+        - `TIME_LIMIT_EXCEEDED`.
+      - Did compilation phase fail?
+        - `COMPILATION_ERROR` (submission-wide terminal before tests).
+      - Did reader/infrastructure error occur?
+        - worker/infrastructure error policy; do not mislabel it as user wrong answer.
+      - Did the program exit non-zero with no more-specific cause?
+        - `RUNTIME_ERROR`.
+      - Did normalized actual stdout equal normalized expected output?
+        - no -> `WRONG_ANSWER`.
+        - yes -> testcase passes.
+    - Core correction
+      - `done=true` says terminated within that wait, not correct or successful.
+      - `exitCode=0` says command success, not correct answer.
+      - `ACCEPTED` requires valid execution evidence plus correct output, then all testcases pass.
+
+  - Testcase aggregation and submission verdict
+    - Compilation is a submission-level gate
+      - Compile once before running cases.
+      - Compilation failure -> `COMPILATION_ERROR`; stop.
+    - Each testcase has its own input, output/evidence, duration, and result.
+    - Fail-fast aggregation (current plan)
+      - Run cases in a defined order.
+      - First terminal testcase failure becomes submission status.
+      - Later tests need not run.
+      - Example: Test 1 AC, Test 2 AC, Test 3 WA -> submission `WRONG_ANSWER`; test 4 not required.
+    - Accepted aggregation
+      - Submission is `ACCEPTED` only after every testcase passes.
+      - Sum recorded testcase durations only under a documented policy.
+    - Keep layers clear
+      - `TestCaseResult`: evidence and verdict for one input.
+      - `SubmissionResult`: aggregate status, runtime, persisted state, client notification.
+
+  - Misconceptions -> corrections
+    - "`waitFor(timeout)` returning true means success."
+      - Correction: it only means the observed process terminated before the deadline.
+    - "`exitCode=0` means Accepted."
+      - Correction: it means command success; Judge still compares actual vs expected output and checks events/resources.
+    - "`exitCode=137` tells the Judge the cause."
+      - Correction: it is ambiguous; consult OOM/output/timeout/kill context.
+    - "Reading output after waiting is safe."
+      - Correction: unconsumed stdout/stderr can fill pipes and block the child, creating a false timeout.
+    - "Reading all output before waiting is safe."
+      - Correction: `readAllBytes()` can wait forever for EOF, preventing timeout code from runing.
+    - "Draining output means it is safe to store all output."
+      - Correction: draining prevents pipe blocking; unbounded storage can OOM the host Judge.
+    - "Container memory limit protects the Judge's ByteArrayOutputStream."
+      - Correction: it protects the container, not host-side accumulated output.
+    - "Container is a kind of thread / is inside a thread."
+      - Correction: a container isolates processes; a process contains threads.
+    - "`destroyForcibly()` on Docker directly kills `java Main` inside the container."
+      - Correction: it directly targets the host Docker CLI child; container cleanup needs its own lifecycle policy.
+    - "Main decides verdict, so Main's timeout event must win."
+      - Correction: final-decision ownership and event-priority policy are separate questions.
+    - "Atomicity always requires a lock."
+      - Correction: choose the fitting primitive; `AtomicInteger` can solve an increment, and a boolean signal mainly needs visibility/ordering.
+
+  - Active recall / implementation checklist
+    - Process model
+      - In `ProcessBuilder("docker", "run", ..., "judge-java", "bash", "-c", "java Main")`, what is the host executable? What is the image? Who parses `&&`? Who starts the JVM?
+      - If `pb.start()` launches `docker`, which OS process does `Process.destroyForcibly()` directly target?
+      - State the relationship: process vs thread vs container.
+    - Streams
+      - From the parent view, map `getInputStream`, `getErrorStream`, and `getOutputStream` to child stdout, stderr, stdin.
+      - What changes when `redirectErrorStream(true)` is enabled? What information is lost?
+    - Pipe/output safety
+      - Why can `readAllBytes()` before timeout prevent the timeout from ever executing?
+      - Why can waiting before draining cause a child that only runs 500 ms to look like a 3-second TLE?
+      - Why is "stop reading after output limit" unsafe if the child continues running?
+      - Why does `--memory=128m` not prevent the host worker from storing 2 GB of stdout?
+    - Lifecycle/results
+      - Child exits at 100 ms with `137`; what are `waitFor(3s)` and `exitValue()` expected to report? Does that prove acceptance?
+      - What does `done=false` mean, and when is `exitValue()` safe to call?
+      - What extra evidence is needed before classifying `137` as MLE, OLE, TLE, or generic runtime error?
+    - Concurrency
+      - Main reads false before reader writes true: ordering, visibility, or atomicity?
+      - Reader writes true before Main reads but there is no synchronization: which issue?
+      - Two threads execute `counter = counter + 1` and one increment is lost: which issue?
+      - Why should Main await reader completion before comparing `outputBuffer`?
+      - Why should Reader emit events but not write final status?
+    - Verdicts/aggregation
+      - `done=true`, exit 0, actual `41`, expected `42`: verdict?
+      - Reader detects output limit and kill leads to exit 137: verdict should derive from which fact?
+      - Test 1 AC, Test 2 AC, Test 3 WA: submission verdict under fail-fast policy?
+      - List the evidence you must retain to explain a final verdict to a developer.
+
+  - Implementation-ready invariants
+    - Start stream draining immediately after `pb.start()`.
+    - Always bound captured output and track bytes.
+    - Monitor the outer deadline independently of reader blocking.
+    - Use an inner timeout for user-code limit and an outer watchdog for the whole host execution.
+    - Publish reader results/events with explicit synchronization and await them before final evaluation.
+    - Keep one final-verdict owner.
+    - Prefer specific observed events over ambiguous exit-code inference.
+    - Run compilation before testcases; accept a submission only after all cases pass.
+    - Clean process/container/temp-directory resources on every success, failure, timeout, and exception path.
+    - Test malicious/high-output, infinite-loop, non-zero exit, wrong-output, OOM-like, and near-simultaneous-event cases.
+
+  - Source trail
+    - Session conversation: Branch · Giải thích ProcessBuilder (ProcessBuilder, pipes, concurrency, verdict reasoning).
+    - `backend-plan.md`: Phase 5 sandbox, Docker command, baseline lifecycle, queue and testcase flow.
+    - `LEARNING_LOG.md`: project learning context and existing mind-map style.
