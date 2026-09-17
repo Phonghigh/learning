@@ -17,3 +17,6 @@ tmp/
 .env
 .env.*
 *.key
+
+# Claude Code worktrees (per-session, not shared repo state)
+.claude/worktrees/
